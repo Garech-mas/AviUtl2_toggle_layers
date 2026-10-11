@@ -139,7 +139,13 @@
     <ClCompile Include="toggle_layers_exedit2.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="toggle_layers.ini" />
+    <None Include="assets\toggle_layers.ini" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="resource.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="toggle_layers.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

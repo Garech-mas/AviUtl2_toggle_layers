@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDR_TOGGLE_LAYERS_INI RCDATA "assets\\toggle_layers.ini"

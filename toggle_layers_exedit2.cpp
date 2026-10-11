@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstdio>
@@ -11,6 +12,8 @@
 
 #include "plugin2.h"
 #include "logger2.h"
+// Resource header for embedded toggle_layers.ini
+#include "resource.h"
 
 namespace {
 
@@ -29,7 +32,7 @@ namespace {
 
 	COMMON_PLUGIN_TABLE g_plugin_table = {
 		L"レイヤー一括切り替え",
-		L"レイヤー一括切り替え v2.0 ported by Garech"
+		L"レイヤー一括切り替え v2.1 ported by Garech"
 	};
 
 	// ------------------------------------------------------------------
@@ -154,9 +157,35 @@ namespace {
 		const std::wstring dir = (slash == std::wstring::npos) ? std::wstring(L".") : path.substr(0, slash);
 		g_ini_path = dir + L"\\" + kIniFileName;
 
-		if (GetFileAttributesW(g_ini_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-			Log(LogLevel::Warn, L"設定ファイルが見つかりません: %ls", g_ini_path.c_str());
-			return ConfigStatus::IniMissing;
+		// 既に設定ファイルが存在する場合はそれを使う
+		bool embedded_written = false;
+		if (GetFileAttributesW(g_ini_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+			Log(LogLevel::Verbose, L"既存の設定ファイルを使用します: %ls", g_ini_path.c_str());
+		}
+		else {
+			// 設定ファイルがない場合はリソースから展開する
+			HRSRC hres = FindResourceW(g_instance, MAKEINTRESOURCEW(IDR_TOGGLE_LAYERS_INI), RT_RCDATA);
+			if (hres != nullptr) {
+				HGLOBAL hglob = LoadResource(g_instance, hres);
+				if (hglob != nullptr) {
+					void* data = LockResource(hglob);
+					const DWORD size = SizeofResource(g_instance, hres);
+					if (data != nullptr && size > 0) {
+						HANDLE fh = CreateFileW(g_ini_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+						if (fh != INVALID_HANDLE_VALUE) {
+							DWORD written = 0;
+							if (WriteFile(fh, data, size, &written, nullptr) && written == size) {
+								Log(LogLevel::Verbose, L"埋め込み設定ファイルを展開しました: %ls", g_ini_path.c_str());
+								embedded_written = true;
+							}
+							else {
+								Log(LogLevel::Warn, L"埋め込み設定ファイルの書き出しに失敗しました: %ls (err=%lu)", g_ini_path.c_str(), GetLastError());
+							}
+							CloseHandle(fh);
+						}
+					}
+				}
+			}
 		}
 
 		constexpr DWORD kBufSize = 32768;
@@ -248,14 +277,14 @@ namespace {
 
 	// 画面X座標 x のフレーム番号 (レイヤー編集上でなければ false)
 	bool FrameAtX(EDIT_SECTION* edit, int x, int y, int* frame) {
-    int layer = 0;
-	if (!edit->pos_to_layer_frame(x, y, &layer, frame)) {
-		return false;
-	}
-	if (layer < 0 || (frame != nullptr && *frame < 0)) {
-		return false;
-	}
-	return true;
+		int layer = 0;
+		if (!edit->pos_to_layer_frame(x, y, &layer, frame)) {
+			return false;
+		}
+		if (layer < 0 || (frame != nullptr && *frame < 0)) {
+			return false;
+		}
+		return true;
 	}
 
 	// x 以降で、フレーム番号が target 以上になる最小のX座標を探す (右へ向かって単調増加と仮定)
@@ -334,12 +363,12 @@ namespace {
 		}
 		int layer = 0;
 		int frame = 0;
-    if (!edit->pos_to_layer_frame(q.point.x, q.point.y, &layer, &frame)) {
-		return;
-	}
-	if (layer < 0 || frame < 0) {
-		return;
-	}
+		if (!edit->pos_to_layer_frame(q.point.x, q.point.y, &layer, &frame)) {
+			return;
+		}
+		if (layer < 0 || frame < 0) {
+			return;
+		}
 		q.layer = layer;
 		q.enable = edit->get_layer_enable(layer);
 		q.locked = edit->get_layer_lock(layer);
@@ -366,9 +395,9 @@ namespace {
 		int layer = r.last_layer;
 		int hit = 0;
 		int frame = 0;
-    if (edit->pos_to_layer_frame(r.x, r.y, &hit, &frame) && hit >= 0 && frame >= 0) {
-		layer = hit;
-	}
+		if (edit->pos_to_layer_frame(r.x, r.y, &hit, &frame) && hit >= 0 && frame >= 0) {
+			layer = hit;
+		}
 		if (!r.first && layer == r.last_layer) {
 			return;
 		}
@@ -645,9 +674,7 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 		return;
 	}
 
-	if (LoadConfig() == ConfigStatus::IniMissing) {
-		ShowIniMissingNotice();
-	}
+	LoadConfig();
 
 	// ホストの UI スレッドにだけフックを掛ける (システム全体の入力には影響しない)
 	const HWND host_window = g_edit_handle->get_host_app_window();
