@@ -220,31 +220,14 @@ namespace {
 		return ConfigStatus::Loaded;
 	}
 
-	// ini が無かった時に、ホストのウィンドウを親にしてメッセージボックスを出す
+	// ini が無かった時にメッセージボックスを出す
 	void ShowIniMissingNotice() {
 		std::wstring text = L"設定ファイルが見つかりません。\n\n";
 		text += g_ini_path;
-		text += L"\n\nファイルを配置するまで、レイヤー一括切り替えは動作しません。\n\n"
-			L"[mouse_override.layer.drag] セクションに「ボタン=動作」を書いてください。\n"
-			L"  ボタン: l / r / m / x1 / x2 (修飾キーは l<ctrl+shift> のように指定)\n"
-			L"  動作: 0=なし 1=表示切替 2=ロック切替 (例: l=1)";
+		text += L"\n\nファイルを配置するまで、レイヤー一括切り替えは動作しません。\n\n";
 
 		const HWND owner = (g_edit_handle != nullptr) ? g_edit_handle->get_host_app_window() : nullptr;
 		MessageBoxW(owner, text.c_str(), g_plugin_table.name, MB_OK | MB_ICONWARNING);
-	}
-
-	void CALLBACK IniMissingTimerProc(HWND, UINT, UINT_PTR id, DWORD) {
-		KillTimer(nullptr, id);
-		g_notice_timer = 0;
-		ShowIniMissingNotice();
-	}
-
-	// ホストの起動処理を止めないよう、メッセージループが回ってから出す
-	void ScheduleIniMissingNotice() {
-		g_notice_timer = SetTimer(nullptr, 0, kNoticeDelayMs, IniMissingTimerProc);
-		if (g_notice_timer == 0) {
-			ShowIniMissingNotice();
-		}
 	}
 
 	// ------------------------------------------------------------------
@@ -663,13 +646,7 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 	}
 
 	if (LoadConfig() == ConfigStatus::IniMissing) {
-		ScheduleIniMissingNotice();
-	}
-
-	// 割り当てが1つも無ければ、フックを設置する意味がない
-	if (g_action_count == 0) {
-		Log(LogLevel::Verbose, L"有効な割り当てがないため、マウスフックを設置しません。");
-		return;
+		ShowIniMissingNotice();
 	}
 
 	// ホストの UI スレッドにだけフックを掛ける (システム全体の入力には影響しない)
