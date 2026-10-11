@@ -29,7 +29,7 @@ namespace {
 
 	COMMON_PLUGIN_TABLE g_plugin_table = {
 		L"レイヤー一括切り替え",
-		L"レイヤー一括切り替え v2.0 forked by Garech"
+		L"レイヤー一括切り替え v2.0 ported by Garech"
 	};
 
 	// ------------------------------------------------------------------
