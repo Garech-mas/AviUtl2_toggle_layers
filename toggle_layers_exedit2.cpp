@@ -1,654 +1,617 @@
 #include <windows.h>
-#include <windows.h>
 #include <algorithm>
-#include <vector>
+#include <array>
+#include <cstdarg>
+#include <cstdlib>
+#include <cstdio>
+#include <cwchar>
+#include <cwctype>
 #include <string>
-#include <unordered_map>
+#include <vector>
 
 #include "plugin2.h"
 #include "logger2.h"
 
-#include <cstdarg>
-
-static LOG_HANDLE* g_logger = nullptr;
-
-static void LogVerbose(const wchar_t* fmt, ...) {
-	wchar_t buf[1024];
-	va_list ap;
-	va_start(ap, fmt);
-	vswprintf_s(buf, fmt, ap);
-	va_end(ap);
-	if (g_logger != nullptr && g_logger->verbose != nullptr) {
-		g_logger->verbose(g_logger, buf);
-	}
-}
-
 namespace {
 
 	constexpr DWORD kRequiredVersion = 2004500; // 必須バージョン: beta45
+	constexpr wchar_t kIniFileName[] = L"toggle_layers.ini";
+	constexpr wchar_t kIniSection[] = L"mouse_override.layer.drag";
+	constexpr UINT kNoticeDelayMs = 500; // ini 無し通知を出すまでの待ち時間(ホストの起動完了待ち)
 
 	HINSTANCE g_instance = nullptr;
+	LOG_HANDLE* g_logger = nullptr;
 	EDIT_HANDLE* g_edit_handle = nullptr;
-	HOST_APP_TABLE* g_host = nullptr;
-	HWND g_message_window = nullptr;
 	HHOOK g_mouse_hook = nullptr;
-	bool g_input_capture = false;
-
-	constexpr wchar_t kMessageWindowClass[] = L"ToggleLayersExEdit2MessageWindow";
-	constexpr UINT kMessageDragStart = WM_APP + 1;
-	constexpr UINT kMessageDragMove = WM_APP + 2;
-	constexpr UINT kMessageDragFinish = WM_APP + 3;
-
-	struct DragState {
-		bool active = false;
-		int probe_x = 0;
-		int last_layer = 0;
-		bool enable = true;
-		bool lock_mode = false;
-	};
-
-	DragState g_drag;
-
-	// マッピングキー: ベース文字列 + 修飾キーのフラグ
-	struct DragKey {
-		std::wstring base;
-		bool ctrl = false;
-		bool shift = false;
-		bool alt = false;
-
-		bool operator==(const DragKey& o) const noexcept {
-			return base == o.base && ctrl == o.ctrl && shift == o.shift && alt == o.alt;
-		}
-	};
-
-	struct DragKeyHash {
-		size_t operator()(DragKey const& k) const noexcept {
-			// simple hash: combine base hash and flag bits
-			std::hash<std::wstring> h;
-			size_t v = h(k.base);
-			size_t f = (k.ctrl ? 1u : 0u) | (k.shift ? 2u : 0u) | (k.alt ? 4u : 0u);
-			return v ^ (f + 0x9e3779b97f4a7c15ULL + (v << 6) + (v >> 2));
-		}
-	};
-
-	std::unordered_map<DragKey, int, DragKeyHash> g_drag_map;
-
-	// ボタンベース文字列
-	constexpr std::wstring_view kBaseL = L"l";
-	constexpr std::wstring_view kBaseR = L"r";
-	constexpr std::wstring_view kBaseM = L"m";
-	constexpr std::wstring_view kBaseX1 = L"x1";
-	constexpr std::wstring_view kBaseX2 = L"x2";
-
-	// 修飾キー判定・正規化用のヘルパ構造体
-	struct Modifiers {
-		bool ctrl = false;
-		bool shift = false;
-		bool alt = false;
-
-		// 現在押されている修飾キーを取得
-		static Modifiers FromCurrentKeys() {
-			Modifiers m;
-			m.ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-			m.shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-			m.alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-			return m;
-		}
-
-		// ToSuffix を廃止：修飾はフラグで扱う
-
-		// iniの修飾子部分（例: "alt+shift+ctrl"）を解析してフラグにする
-		static Modifiers FromModifierString(const std::wstring& raw) {
-			Modifiers m;
-			std::wstring inner = raw;
-			// split by '+'
-			size_t start = 0;
-			while (start < inner.size()) {
-				size_t pos = inner.find(L'+', start);
-				if (pos == std::wstring::npos) pos = inner.size();
-				std::wstring token = inner.substr(start, pos - start);
-				// trim
-				size_t a = 0; while (a < token.size() && iswspace(token[a])) ++a;
-				size_t b = token.size(); while (b > a && iswspace(token[b - 1])) --b;
-				token = token.substr(a, b - a);
-				for (auto& c : token) c = towlower(c);
-				if (token == L"ctrl") m.ctrl = true;
-				else if (token == L"shift") m.shift = true;
-				else if (token == L"alt") m.alt = true;
-				start = pos + 1;
-			}
-			return m;
-		}
-
-	};
-	int g_last_button_code = 0; // 1=L,2=R,3=M,4=X1,5=X2
-	bool g_drag_pending = false;
-	POINT g_pending_point{};
-	int g_pending_button_code = 0;
+	UINT_PTR g_notice_timer = 0;
+	std::wstring g_ini_path;
+	int g_replay_remaining = 0; // SendInput で再送した、まだ届いていないボタンイベントの数
 
 	COMMON_PLUGIN_TABLE g_plugin_table = {
 		L"レイヤー一括切り替え",
 		L"レイヤー一括切り替え v2.0 forked by Garech"
 	};
 
-	struct HeaderHitTest {
-		POINT point{};
-		bool valid = false;
-		bool is_header = false;
-		bool enable = true;
-		bool locked = false;
-		int layer = 0;
-		int probe_x = 0;
-	};
+	// ------------------------------------------------------------------
+	// ログ
+	// ------------------------------------------------------------------
 
-	struct LayerHitTest {
-		POINT point{};
-		bool valid = false;
-		int layer = 0;
-	};
+	enum class LogLevel { Verbose, Warn, Error };
 
-	struct ApplyLayers {
-		bool enable = true;
-		bool lock_mode = false;
-		std::vector<int> layers;
-	};
-
-	// ini ファイルから設定をロード
-	void LoadConfig() {
-		g_drag_map.clear();
-		wchar_t module_path[MAX_PATH]{ 0 };
-		if (GetModuleFileNameW(g_instance, module_path, (DWORD)std::size(module_path)) == 0) {
+	// ログ出力。バッファを超える場合は切り詰める (ログは 1024 文字で制限される)
+	void Log(LogLevel level, const wchar_t* fmt, ...) {
+		if (g_logger == nullptr) {
 			return;
 		}
+		wchar_t buf[1024];
+		va_list ap;
+		va_start(ap, fmt);
+		_vsnwprintf_s(buf, ARRAYSIZE(buf), _TRUNCATE, fmt, ap);
+		va_end(ap);
 
-		std::wstring path(module_path);
-		auto pos = path.find_last_of(L"\\/");
-		std::wstring dir = (pos == std::wstring::npos) ? L"." : path.substr(0, pos);
-		std::wstring ini = dir + L"\\toggle_layers.ini"; // ini 拡張子のファイルを使用
-
-		const wchar_t* section = L"mouse_override.layer.drag";
-		const DWORD bufsize = 32768;
-		std::vector<wchar_t> buf(bufsize);
-		DWORD read = GetPrivateProfileSectionW(section, buf.data(), bufsize, ini.c_str());
-		if (read == 0) {
-			return;
+		void (*write)(LOG_HANDLE*, LPCWSTR) = nullptr;
+		switch (level) {
+		case LogLevel::Verbose: write = g_logger->verbose; break;
+		case LogLevel::Warn: write = g_logger->warn; break;
+		case LogLevel::Error: write = g_logger->error; break;
 		}
+		if (write != nullptr) {
+			write(g_logger, buf);
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// ボタン・修飾キー・割り当て
+	// ------------------------------------------------------------------
+
+	enum class Button : int { L, R, M, X1, X2, Count };
+	constexpr size_t kButtonCount = static_cast<size_t>(Button::Count);
+
+	// 修飾キーのビットフラグ
+	constexpr unsigned kModCtrl = 1;
+	constexpr unsigned kModShift = 2;
+	constexpr unsigned kModAlt = 4;
+	constexpr size_t kModCombos = 8;
+
+	// ini の値: 0 = 割り当てなし(通常動作), 1 = 表示のトグル, 2 = ロックのトグル
+	enum class Action : int { None = 0, ToggleVisible = 1, ToggleLock = 2 };
+
+	// [ボタン][修飾キーのビット] -> 動作。未指定は None (0) になる
+	std::array<std::array<Action, kModCombos>, kButtonCount> g_actions{};
+	size_t g_action_count = 0;
+
+	unsigned CurrentModifiers() {
+		unsigned mods = 0;
+		if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= kModCtrl;
+		if (GetAsyncKeyState(VK_SHIFT) & 0x8000) mods |= kModShift;
+		if (GetAsyncKeyState(VK_MENU) & 0x8000) mods |= kModAlt;
+		return mods;
+	}
+
+	void Trim(std::wstring& s) {
+		size_t a = 0;
+		while (a < s.size() && iswspace(s[a])) ++a;
+		size_t b = s.size();
+		while (b > a && iswspace(s[b - 1])) --b;
+		s = s.substr(a, b - a);
+	}
+
+	void ToLower(std::wstring& s) {
+		for (auto& c : s) c = static_cast<wchar_t>(towlower(c));
+	}
+
+	// "alt+shift+ctrl" のような修飾子部分をビットフラグにする
+	unsigned ParseModifiers(const std::wstring& inner) {
+		unsigned mods = 0;
+		size_t start = 0;
+		for (;;) {
+			size_t pos = inner.find(L'+', start);
+			if (pos == std::wstring::npos) pos = inner.size();
+			std::wstring token = inner.substr(start, pos - start);
+			Trim(token);
+			ToLower(token);
+			if (token == L"ctrl") mods |= kModCtrl;
+			else if (token == L"shift") mods |= kModShift;
+			else if (token == L"alt") mods |= kModAlt;
+			else if (!token.empty()) Log(LogLevel::Warn, L"ini: 不明な修飾キー '%ls' を無視しました。", token.c_str());
+			if (pos >= inner.size()) break;
+			start = pos + 1;
+		}
+		return mods;
+	}
+
+	bool ParseButton(const std::wstring& s, Button* out) {
+		if (s == L"l") *out = Button::L;
+		else if (s == L"r") *out = Button::R;
+		else if (s == L"m") *out = Button::M;
+		else if (s == L"x1") *out = Button::X1;
+		else if (s == L"x2") *out = Button::X2;
+		else return false;
+		return true;
+	}
+
+	Action ParseAction(int value) {
+		if (value == 0) return Action::None;
+		if (value == 2) return Action::ToggleLock;
+		return Action::ToggleVisible; // 1 と、その他の値は表示トグルとして扱う
+	}
+
+	enum class ConfigStatus { Loaded, IniMissing, Failed };
+
+	// ini ファイルから設定をロードする
+	ConfigStatus LoadConfig() {
+		g_actions = {};
+		g_action_count = 0;
+
+		wchar_t module_path[MAX_PATH]{};
+		const DWORD len = GetModuleFileNameW(g_instance, module_path, ARRAYSIZE(module_path));
+		if (len == 0 || len >= ARRAYSIZE(module_path)) {
+			Log(LogLevel::Error, L"DLL のパスを取得できませんでした。");
+			return ConfigStatus::Failed;
+		}
+		const std::wstring path(module_path, len);
+		const size_t slash = path.find_last_of(L"\\/");
+		const std::wstring dir = (slash == std::wstring::npos) ? std::wstring(L".") : path.substr(0, slash);
+		g_ini_path = dir + L"\\" + kIniFileName;
+
+		if (GetFileAttributesW(g_ini_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+			Log(LogLevel::Warn, L"設定ファイルが見つかりません: %ls", g_ini_path.c_str());
+			return ConfigStatus::IniMissing;
+		}
+
+		constexpr DWORD kBufSize = 32768;
+		std::vector<wchar_t> buf(kBufSize);
+		if (GetPrivateProfileSectionW(kIniSection, buf.data(), kBufSize, g_ini_path.c_str()) == 0) {
+			Log(LogLevel::Warn, L"ini: セクション [%ls] がないか空です。", kIniSection);
+			return ConfigStatus::Loaded;
+		}
+
+		std::array<std::array<bool, kModCombos>, kButtonCount> seen{};
+
 		// バッファは複数のヌル終端文字列が連続しており、末尾は二重ヌルで終わる
-		wchar_t* p = buf.data();
-		while (*p != L'\0') {
-			std::wstring line(p);
-			// 次の文字列へ進める
-			p += line.size() + 1;
-
-			auto eq = line.find(L'=');
+		for (const wchar_t* p = buf.data(); *p != L'\0'; p += wcslen(p) + 1) {
+			const std::wstring line(p);
+			const size_t eq = line.find(L'=');
 			if (eq == std::wstring::npos) {
 				continue;
 			}
 			std::wstring key = line.substr(0, eq);
 			std::wstring val = line.substr(eq + 1);
+			Trim(key);
+			Trim(val);
+			ToLower(key);
 
-			// key/val の前後空白をトリム
-			auto trim = [](std::wstring& s) {
-				size_t a = 0;
-				while (a < s.size() && iswspace(s[a])) ++a;
-				size_t b = s.size();
-				while (b > a && iswspace(s[b - 1])) --b;
-				s = s.substr(a, b - a);
-				};
-			trim(key);
-			trim(val);
-
-			// キーを正規化（小文字化、修飾子順序を標準化）
-			for (auto& c : key) c = towlower(c);
-			size_t lt = key.find(L'<');
-			size_t gt = key.find_last_of(L'>');
+			// "l<ctrl+shift>" 形式: ベース文字列 + 修飾キー
 			std::wstring base = key;
-			Modifiers m;
+			unsigned mods = 0;
+			const size_t lt = key.find(L'<');
+			const size_t gt = key.find_last_of(L'>');
 			if (lt != std::wstring::npos && gt != std::wstring::npos && gt > lt) {
 				base = key.substr(0, lt);
-				std::wstring inner = key.substr(lt + 1, gt - lt - 1);
-				m = Modifiers::FromModifierString(inner);
+				mods = ParseModifiers(key.substr(lt + 1, gt - lt - 1));
 			}
-			// trim base
-			size_t a = 0; while (a < base.size() && iswspace(base[a])) ++a;
-			size_t b = base.size(); while (b > a && iswspace(base[b - 1])) --b;
-			base = base.substr(a, b - a);
+			Trim(base);
 
-			DragKey dk{ base, m.ctrl, m.shift, m.alt };
-			int ival = _wtoi(val.c_str());
-			g_drag_map.emplace(dk, ival);
+			Button button;
+			if (!ParseButton(base, &button)) {
+				Log(LogLevel::Warn, L"ini: 不明なボタン '%ls' を無視しました。", key.c_str());
+				continue;
+			}
+
+			// 重複キーは先に書かれたものを優先する (Windows の ini の扱いと同じ)
+			if (seen[static_cast<size_t>(button)][mods]) {
+				Log(LogLevel::Warn, L"ini: キー '%ls' が重複しています。先の指定を使用します。", key.c_str());
+				continue;
+			}
+			seen[static_cast<size_t>(button)][mods] = true;
+
+			const int value = _wtoi(val.c_str());
+			if (value < 0 || value > 2) {
+				Log(LogLevel::Warn, L"ini: '%ls' の値 %d は未定義です。表示トグルとして扱います。", key.c_str(), value);
+			}
+			const Action action = ParseAction(value);
+			g_actions[static_cast<size_t>(button)][mods] = action;
+			if (action != Action::None) {
+				++g_action_count;
+			}
+		}
+
+		Log(LogLevel::Verbose, L"設定を読み込みました (割り当て %zu 件): %ls", g_action_count, g_ini_path.c_str());
+		return ConfigStatus::Loaded;
+	}
+
+	// ini が無かった時に、ホストのウィンドウを親にしてメッセージボックスを出す
+	void ShowIniMissingNotice() {
+		std::wstring text = L"設定ファイルが見つかりません。\n\n";
+		text += g_ini_path;
+		text += L"\n\nファイルを配置するまで、レイヤー一括切り替えは動作しません。\n\n"
+			L"[mouse_override.layer.drag] セクションに「ボタン=動作」を書いてください。\n"
+			L"  ボタン: l / r / m / x1 / x2 (修飾キーは l<ctrl+shift> のように指定)\n"
+			L"  動作: 0=なし 1=表示切替 2=ロック切替 (例: l=1)";
+
+		const HWND owner = (g_edit_handle != nullptr) ? g_edit_handle->get_host_app_window() : nullptr;
+		MessageBoxW(owner, text.c_str(), g_plugin_table.name, MB_OK | MB_ICONWARNING);
+	}
+
+	void CALLBACK IniMissingTimerProc(HWND, UINT, UINT_PTR id, DWORD) {
+		KillTimer(nullptr, id);
+		g_notice_timer = 0;
+		ShowIniMissingNotice();
+	}
+
+	// ホストの起動処理を止めないよう、メッセージループが回ってから出す
+	void ScheduleIniMissingNotice() {
+		g_notice_timer = SetTimer(nullptr, 0, kNoticeDelayMs, IniMissingTimerProc);
+		if (g_notice_timer == 0) {
+			ShowIniMissingNotice();
 		}
 	}
 
-	// レイヤー名領域がクリックされたかを判定
-	void ReadHeaderHitTestImpl(void* param, EDIT_SECTION* edit) {
-		auto& hit = *static_cast<HeaderHitTest*>(param);
+	// ------------------------------------------------------------------
+	// 編集セクション内の処理
+	// ------------------------------------------------------------------
 
-		if (edit == nullptr || edit->info == nullptr) {
-			return;
-		}
-
-		int clicked_layer = 0;
-		int clicked_frame = 0;
-
-		// 最初のクリック位置で座標変換できなければ、操作対象外とする
-		if (!edit->pos_to_layer_frame(
-			hit.point.x, hit.point.y, &clicked_layer, &clicked_frame)) {
-			return;
-		}
-
-		hit.valid = true;
-		hit.layer = clicked_layer;
-		hit.probe_x = hit.point.x;
-		hit.enable = edit->get_layer_enable(clicked_layer);
-		hit.locked = edit->get_layer_lock(clicked_layer);
-
-		// 先頭表示フレーム以下の場合のみ、レイヤーヘッダー操作とする
-		hit.is_header = clicked_frame <= edit->info->display_frame_start;
-	}
-
-	// ReadHeaderHitTestImpl を呼び出すラッパー
-	void ReadHeaderHitTest(void* param, EDIT_SECTION* edit) {
-		auto* hit = static_cast<HeaderHitTest*>(param);
-		// 初期状態は無効とする
-		hit->valid = false;
-		hit->is_header = false;
+	// 編集セクションのコールバック内で起きた例外を握りつぶし、コードをログに残す
+	// (__try を使う関数にはデストラクタを持つオブジェクトを置けないので、中身は持たせない)
+	template <void (*Impl)(void*, EDIT_SECTION*)>
+	void SafeEdit(void* param, EDIT_SECTION* edit) {
 		__try {
-			ReadHeaderHitTestImpl(param, edit);
+			Impl(param, edit);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
-			hit->valid = false;
-			hit->is_header = false;
-			LogVerbose(L"レイヤー名領域の判定に失敗しました。");
+			Log(LogLevel::Error, L"編集セクション内で例外が発生しました (code=0x%08lX)", GetExceptionCode());
 		}
 	}
 
-	// 指定座標が有効なレイヤー位置かを判定
-	void ReadLayerHitTestImpl(void* param, EDIT_SECTION* edit) {
-		auto& hit = *static_cast<LayerHitTest*>(param);
-		if (edit == nullptr || edit->info == nullptr) {
-			return;
-		}
+	// 画面X座標 x のフレーム番号 (レイヤー編集上でなければ false)
+	bool FrameAtX(EDIT_SECTION* edit, int x, int y, int* frame) {
+    int layer = 0;
+	if (!edit->pos_to_layer_frame(x, y, &layer, frame)) {
+		return false;
+	}
+	if (layer < 0 || (frame != nullptr && *frame < 0)) {
+		return false;
+	}
+	return true;
+	}
+
+	// x 以降で、フレーム番号が target 以上になる最小のX座標を探す (右へ向かって単調増加と仮定)
+	bool FindFrameStartX(EDIT_SECTION* edit, int x, int y, int limit, int target, int* found) {
 		int frame = 0;
-		hit.valid = edit->pos_to_layer_frame(hit.point.x, hit.point.y, &hit.layer, &frame);
-	}
-
-	// ReadLayerHitTestImpl を呼び出すラッパー
-	void ReadLayerHitTest(void* param, EDIT_SECTION* edit) {
-		auto* hit = static_cast<LayerHitTest*>(param);
-		// 初期状態は無効とする
-		hit->valid = false;
-		__try {
-			ReadLayerHitTestImpl(param, edit);
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			hit->valid = false;
-			LogVerbose(L"レイヤー位置の判定に失敗しました。");
-		}
-	}
-
-	// 実際にレイヤーの表示/ロック状態を切り替える
-	void ApplyLayerVisibilityImpl(void* param, EDIT_SECTION* edit) {
-		if (edit == nullptr || edit->info == nullptr) {
-			return;
-		}
-		const auto& request = *static_cast<ApplyLayers*>(param);
-		for (const int layer : request.layers) {
-			if (request.lock_mode) {
-				if (edit->get_layer_lock(layer) != request.enable) {
-					edit->set_layer_lock(layer, request.enable);
-				}
-			}
-			else if (edit->get_layer_enable(layer) != request.enable) {
-				edit->set_layer_enable(layer, request.enable);
-			}
-		}
-	}
-
-	// ApplyLayerVisibilityImpl を呼び出すラッパー（例外ハンドリングは行わない）
-	void ApplyLayerVisibility(void* param, EDIT_SECTION* edit) {
-		__try {
-			ApplyLayerVisibilityImpl(param, edit);
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			LogVerbose(L"レイヤー状態の編集に失敗しました。");
-		}
-	}
-
-
-	// マウスの Y 座標が変化する度に呼ばれる
-	// ドラッグ中のレイヤー範囲を判定する
-	void TrackMouseY(int screen_y) {
-		if (!g_drag.active || g_edit_handle == nullptr) {
-			return;
-		}
-
-		LayerHitTest hit{ {g_drag.probe_x, screen_y} };
-		if (g_edit_handle->call_edit_section_param(&hit, ReadLayerHitTest) && hit.valid) {
-			ApplyLayers request;
-			request.enable = g_drag.enable;
-			request.lock_mode = g_drag.lock_mode;
-			// ドラッグ範囲全体を毎回収集して適用する（履歴を保持しない）
-			int first = g_drag.last_layer;
-			int last = hit.layer;
-			if (first > last) std::swap(first, last);
-			request.layers.clear();
-			for (int layer = first; layer <= last; ++layer) {
-				request.layers.push_back(layer);
-			}
-
-			if (!request.layers.empty() &&
-				!g_edit_handle->call_edit_section_param(&request, ApplyLayerVisibility)) {
-				return;
-			}
-
-			g_drag.last_layer = hit.layer;
-		}
-	}
-
-	// ドラッグ操作を終了し、状態をリセットする
-	void FinishDrag() {
-		if (!g_drag.active) {
-			return;
-		}
-		g_drag = {};
-	}
-
-	// ドラッグ操作を開始する時に呼ばれる
-	// レイヤーの切り替え操作を行い、ドラッグ開始状態を保持する
-	// マッピングの値:
-	// 0 = 割り当てなし（操作しない：DefWindowProcW に回す）
-	// 1 = レイヤーの表示をトグル（ON/OFF を切り替え）
-	// 2 = レイヤーのロックをトグル（ON/OFF を切り替え）
-	bool BeginDrag(const POINT point, int button_code) {
-		if (g_edit_handle == nullptr) {
+		if (!FrameAtX(edit, x, y, &frame)) {
 			return false;
 		}
-
-		HeaderHitTest hit;
-		hit.point = point;
-
-		// レイヤー名領域がクリックされていない場合は、切替操作を行わない
-		if (!g_edit_handle->call_edit_section_param(&hit, ReadHeaderHitTest) ||
-			!hit.valid || !hit.is_header) {
-			LogVerbose(L"BeginDrag: header hit test failed (valid=%d is_header=%d)", hit.valid ? 1 : 0, hit.is_header ? 1 : 0);
-			return false;
+		if (frame >= target) {
+			*found = x;
+			return true;
 		}
 
-		// ボタンに応じたベース文字列（小文字の定数を使用）
-		std::wstring_view base = kBaseL;
-		switch (button_code) {
-		case 1: base = kBaseL; break;
-		case 2: base = kBaseR; break;
-		case 3: base = kBaseM; break;
-		case 4: base = kBaseX1; break;
-		case 5: base = kBaseX2; break;
-		default: base = kBaseL; break;
-		}
-
-		// ボタンと現在の修飾キーから検索キーを作成
-		Modifiers mods = Modifiers::FromCurrentKeys();
-		DragKey lookup{ std::wstring(base), mods.ctrl, mods.shift, mods.alt };
-
-		int code = -1;
-		auto it = g_drag_map.find(lookup);
-		// 修飾キーが無い場合のみベースでのフォールバックを行う
-		if (it == g_drag_map.end() && !mods.ctrl && !mods.shift && !mods.alt) {
-			DragKey basekey{ std::wstring(base), false, false, false };
-			it = g_drag_map.find(basekey);
-		}
-
-		if (it != g_drag_map.end()) {
-			code = it->second;
-		}
-		else {
-			// マッピング未指定は 0 (割り当てなし) として扱う
-			code = 0;
-		}
-
-		bool final_lock_mode = false;
-		bool final_enable = false;
-
-		if (code >= 0) {
-			// mapping exists
-			if (code == 0) {
-				// explicit no-assignment: do not start special handling
+		// 指数探索で上限を見つけてから二分探索する。lo は frame < target、hi は frame >= target
+		int lo = x;
+		int hi = x;
+		for (int step = 1;; step *= 2) {
+			hi = (std::min)(x + step, limit);
+			if (hi <= lo || !FrameAtX(edit, hi, y, &frame)) {
 				return false;
 			}
-			else if (code == 1) {
-				final_lock_mode = false;
-				final_enable = !hit.enable; // toggle visibility
+			if (frame >= target) {
+				break;
 			}
-			else if (code == 2) {
-				final_lock_mode = true;
-				final_enable = !hit.locked; // toggle lock
+			lo = hi;
+		}
+		while (hi - lo > 1) {
+			const int mid = lo + (hi - lo) / 2;
+			if (!FrameAtX(edit, mid, y, &frame)) {
+				return false;
+			}
+			if (frame >= target) {
+				hi = mid;
 			}
 			else {
-				// unknown value: デフォルトは表示トグルとする
-				final_lock_mode = false;
-				final_enable = !hit.enable;
+				lo = mid;
 			}
 		}
-		else {
-			// no mapping found: デフォルトは表示トグルとする
-			final_lock_mode = false;
-			final_enable = !hit.enable;
-		}
-
-		g_drag.active = true;
-		g_drag.probe_x = hit.probe_x;
-		g_drag.last_layer = hit.layer;
-		g_drag.lock_mode = final_lock_mode;
-		g_drag.enable = final_enable;
-
-
-		ApplyLayers request;
-		request.enable = g_drag.enable;
-		request.lock_mode = g_drag.lock_mode;
-		request.layers.push_back(hit.layer);
-		if (!g_edit_handle->call_edit_section_param(&request, ApplyLayerVisibility)) {
-			LogVerbose(L"BeginDrag: ApplyLayerVisibility failed for initial layer %d", hit.layer);
-			g_drag = {};
-			return false;
-		}
-
+		*found = hi;
 		return true;
 	}
 
-	// ドラッグ操作を制御する用のウィンドウプロシージャ
-	LRESULT CALLBACK MessageWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-		const POINT point{
-			static_cast<LONG>(static_cast<LONG_PTR>(wparam)),
-			static_cast<LONG>(static_cast<LONG_PTR>(lparam))
-		};
+	// クリック位置がレイヤーヘッダー(左側のレイヤー名領域)かを判定する
+	bool IsLayerHeader(EDIT_SECTION* edit, int x, int y, int frame) {
+		const int start = edit->info->display_frame_start;
+		if (frame < start) return true;
+		if (frame > start) return false;
 
-		switch (message) {
-		case kMessageDragStart:
-			if (g_drag.active) {
-				FinishDrag();
-			}
-			// 実際にマウスが動くまで操作開始を遅延する
-			g_drag_pending = true;
-			g_pending_point = point;
-			g_pending_button_code = g_last_button_code;
-			return 0;
-
-		case kMessageDragMove:
-			if (g_drag_pending) {
-				// 押下後の最初の移動時：マッピングが許可するならドラッグを開始する
-				if (BeginDrag(g_pending_point, g_pending_button_code)) {
-					// 開始成功: 現在位置で処理
-					TrackMouseY(point.y);
-				}
-				else {
-					// not handled: 再送して通常クリックにする
-					INPUT input{};
-					input.type = INPUT_MOUSE;
-					switch (g_pending_button_code) {
-					case 1: input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN; break;
-					case 2: input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; break;
-					case 3: input.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN; break;
-					case 4: input.mi.dwFlags = MOUSEEVENTF_XDOWN; input.mi.mouseData = XBUTTON1 << 16; break;
-					case 5: input.mi.dwFlags = MOUSEEVENTF_XDOWN; input.mi.mouseData = XBUTTON2 << 16; break;
-					default: input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN; break;
-					}
-					SendInput(1, &input, sizeof(INPUT));
-
-					// キャプチャを解除して以降のイベントを通常処理へ戻す
-					g_input_capture = false;
-				}
-
-				g_drag_pending = false;
-			}
-			else if (g_drag.active) {
-				TrackMouseY(point.y);
-			}
-			return 0;
-
-		case kMessageDragFinish:
-			if (g_drag_pending) {
-				// マウスが移動せずに離された: クリックとして再送 (down -> up)
-				INPUT inputs[2]{};
-				inputs[0].type = INPUT_MOUSE; inputs[1].type = INPUT_MOUSE;
-				switch (g_pending_button_code) {
-				case 1:
-					inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN; inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP; break;
-				case 2:
-					inputs[0].mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; inputs[1].mi.dwFlags = MOUSEEVENTF_RIGHTUP; break;
-				case 3:
-					inputs[0].mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN; inputs[1].mi.dwFlags = MOUSEEVENTF_MIDDLEUP; break;
-				case 4:
-					inputs[0].mi.dwFlags = MOUSEEVENTF_XDOWN; inputs[0].mi.mouseData = XBUTTON1 << 16;
-					inputs[1].mi.dwFlags = MOUSEEVENTF_XUP; inputs[1].mi.mouseData = XBUTTON1 << 16; break;
-				case 5:
-					inputs[0].mi.dwFlags = MOUSEEVENTF_XDOWN; inputs[0].mi.mouseData = XBUTTON2 << 16;
-					inputs[1].mi.dwFlags = MOUSEEVENTF_XUP; inputs[1].mi.mouseData = XBUTTON2 << 16; break;
-				default:
-					inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN; inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP; break;
-				}
-				SendInput(2, inputs, sizeof(INPUT));
-				g_drag_pending = false;
-				g_input_capture = false;
-			}
-			else if (g_drag.active) {
-				TrackMouseY(point.y);
-				FinishDrag();
-			}
-			return 0;
+		// frame == start のとき、ヘッダーと「先頭表示フレームのセル」は同じフレーム番号になり得る。
+		// 先頭セルの左端(=ヘッダーの右端)を、次のフレーム境界とセル幅から逆算して区別する。
+		const int limit = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1;
+		int x1 = 0;
+		int x2 = 0;
+		if (!FindFrameStartX(edit, x, y, limit, start + 1, &x1) ||
+			!FindFrameStartX(edit, x1, y, limit, start + 2, &x2)) {
+			Log(LogLevel::Verbose, L"ヘッダー境界を求められませんでした。ヘッダー扱いにします。");
+			return true;
 		}
-
-		return DefWindowProcW(window, message, wparam, lparam);
+		const int content_left = x1 - (x2 - x1);
+		return x < content_left;
 	}
 
-	// ローレベルマウスフックプロシージャ
-	// 修飾キーが押されている場合はメッセージウィンドウへ操作を転送する
-	LRESULT CALLBACK MouseHookProc(int code, WPARAM wparam, LPARAM lparam) {
-		if (code < HC_ACTION) {
-			return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
+	struct HeaderQuery {
+		POINT point{};
+		bool hit = false;    // レイヤーヘッダー上か
+		bool enable = true;
+		bool locked = false;
+		int layer = 0;
+	};
+
+	// レイヤーヘッダー上がクリックされたかと、そのレイヤーの状態を取得する
+	void HeaderHitTestImpl(void* param, EDIT_SECTION* edit) {
+		auto& q = *static_cast<HeaderQuery*>(param);
+		if (edit == nullptr || edit->info == nullptr) {
+			return;
+		}
+		int layer = 0;
+		int frame = 0;
+    if (!edit->pos_to_layer_frame(q.point.x, q.point.y, &layer, &frame)) {
+		return;
+	}
+	if (layer < 0 || frame < 0) {
+		return;
+	}
+		q.layer = layer;
+		q.enable = edit->get_layer_enable(layer);
+		q.locked = edit->get_layer_lock(layer);
+		q.hit = IsLayerHeader(edit, q.point.x, q.point.y, frame);
+	}
+
+	struct TrackRequest {
+		int x = 0;           // 判定に使うスクリーン座標 (X は押下位置で固定)
+		int y = 0;
+		int last_layer = 0;  // 入出力: 最後に反映したレイヤー
+		bool first = true;   // 最初の1回は、同じレイヤーでも反映する
+		bool enable = true;
+		bool lock_mode = false;
+	};
+
+	// 現在位置までのレイヤー範囲に、表示/ロック状態を反映する
+	void TrackImpl(void* param, EDIT_SECTION* edit) {
+		auto& r = *static_cast<TrackRequest*>(param);
+		if (edit == nullptr || edit->info == nullptr) {
+			return;
 		}
 
-		const auto& mouse = *reinterpret_cast<const MSLLHOOKSTRUCT*>(lparam);
-		// フォールバックで再送したマウス入力を再処理しない
-		if ((mouse.flags & LLMHF_INJECTED) != 0) {
-			return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
+		// 位置を取れなかった場合は、最後のレイヤーのままとして扱う
+		int layer = r.last_layer;
+		int hit = 0;
+		int frame = 0;
+    if (edit->pos_to_layer_frame(r.x, r.y, &hit, &frame) && hit >= 0 && frame >= 0) {
+		layer = hit;
+	}
+		if (!r.first && layer == r.last_layer) {
+			return;
 		}
-		const UINT message = static_cast<UINT>(wparam);
 
-		// 各ボタンのダウンイベントを処理 (L, R, M, X1/X2)
-		if (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN) {
-			int button_code = 0;
-			if (message == WM_LBUTTONDOWN) button_code = 1;
-			else if (message == WM_RBUTTONDOWN) button_code = 2;
-			else if (message == WM_MBUTTONDOWN) button_code = 3;
-			else if (message == WM_XBUTTONDOWN) {
-				const DWORD which = HIWORD(mouse.mouseData);
-				button_code = (which == XBUTTON1) ? 4 : 5;
-			}
-
-			// クリック位置のウィンドウを取得し、同一プロセスのウィンドウであれば処理を開始する
-			const HWND target_window = WindowFromPoint(mouse.pt);
-			if (g_message_window != nullptr) {
-				DWORD process_id = 0;
-				GetWindowThreadProcessId(target_window, &process_id);
-
-				// マッピングが設定されているかに基づいて開始判定する
-				if (process_id == GetCurrentProcessId()) {
-					// BeginDrag と同様にベース文字列を定義（定数利用）
-					std::wstring_view base = kBaseL;
-					switch (button_code) {
-					case 1: base = kBaseL; break;
-					case 2: base = kBaseR; break;
-					case 3: base = kBaseM; break;
-					case 4: base = kBaseX1; break;
-					case 5: base = kBaseX2; break;
-					default: base = kBaseL; break;
-					}
-
-					Modifiers mods = Modifiers::FromCurrentKeys();
-					DragKey lookup{ std::wstring(base), mods.ctrl, mods.shift, mods.alt };
-
-					// ルックアップ
-					auto it = g_drag_map.find(lookup);
-					// 修飾キーが無い場合のみベースでのフォールバックを行う
-					if (it == g_drag_map.end() && !mods.ctrl && !mods.shift && !mods.alt) {
-						DragKey basekey{ std::wstring(base), false, false, false };
-						it = g_drag_map.find(basekey);
-					}
-
-					if (it == g_drag_map.end()) {
-						// マッピング無し -> 通常処理へ委ねる
-					}
-					else {
-						int code = it->second;
-						if (code == 0) {
-							// 明示的に割り当て無し -> 処理しない
-						}
-						else {
-							// ヘッダーがクリックされたか確認する
-							if (g_edit_handle != nullptr) {
-								HeaderHitTest hit;
-								hit.point = mouse.pt;
-								if (g_edit_handle->call_edit_section_param(&hit, ReadHeaderHitTest) && hit.valid && hit.is_header) {
-									// ヘッダーがクリックされた -> キャプチャ
-									g_last_button_code = button_code;
-									if (PostMessageW(g_message_window, kMessageDragStart,
-										static_cast<WPARAM>(mouse.pt.x), static_cast<LPARAM>(mouse.pt.y))) {
-										g_input_capture = true;
-										return 1;
-									}
-									else {
-										LogVerbose(L"MouseHookProc: failed to post kMessageDragStart");
-									}
-								}
-								else {
-									LogVerbose(L"MouseHookProc: header hit test failed or not header (valid=%d is_header=%d)", hit.valid ? 1 : 0, hit.is_header ? 1 : 0);
-								}
-							}
-							else {
-								LogVerbose(L"MouseHookProc: g_edit_handle is null -> not capturing");
-							}
-						}
-					}
+		const int lo = (std::min)(r.last_layer, layer);
+		const int hi = (std::max)(r.last_layer, layer);
+		for (int l = lo; l <= hi; ++l) {
+			if (r.lock_mode) {
+				if (edit->get_layer_lock(l) != r.enable) {
+					edit->set_layer_lock(l, r.enable);
 				}
 			}
-		}
-		else if (g_input_capture && message == WM_MOUSEMOVE) {
-			// ドラッグは観察し続けるが、マウス移動メッセージ自体は奪わない。
-			// ローレベルフックで WM_MOUSEMOVE をブロックすると、システムカーソルの
-			// 位置更新が止まり、ポインタが固まって見えるためである。
-			if (!PostMessageW(g_message_window, kMessageDragMove,
-				static_cast<WPARAM>(mouse.pt.x), static_cast<LPARAM>(mouse.pt.y))) {
-				g_input_capture = false;
+			else if (edit->get_layer_enable(l) != r.enable) {
+				edit->set_layer_enable(l, r.enable);
 			}
 		}
-		else if (g_input_capture && (message == WM_LBUTTONUP || message == WM_RBUTTONUP || message == WM_MBUTTONUP || message == WM_XBUTTONUP)) {
-			g_input_capture = false;
-			if (PostMessageW(g_message_window, kMessageDragFinish,
-				static_cast<WPARAM>(mouse.pt.x), static_cast<LPARAM>(mouse.pt.y))) {
-				return 1;
-			}
+		r.last_layer = layer;
+	}
+
+	// ------------------------------------------------------------------
+	// ドラッグ操作
+	// ------------------------------------------------------------------
+
+	// 押下を奪ってから離すまでの状態。
+	// 押下時にすべて決め、最初にマウスが動いた時点で切り替えを始める。
+	// 動かずに離された場合は、押下を通常のクリックとして再送する。
+	struct Gesture {
+		bool active = false;
+		bool armed = false;    // ドラッグと見なせる距離まで動いたか (false のままなら単なるクリック)
+		bool started = false;  // 切り替えを開始したか
+		Button button = Button::L;
+		POINT down{};
+		int last_y = 0;
+		HWND capture = nullptr;
+		TrackRequest track;
+	};
+
+	Gesture g_gesture;
+
+	// ボタンの入れ替え設定を考慮して、論理ボタンに対応する物理ボタンの VK を返す
+	int VirtualKeyOf(Button button) {
+		const bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+		switch (button) {
+		case Button::L: return swapped ? VK_RBUTTON : VK_LBUTTON;
+		case Button::R: return swapped ? VK_LBUTTON : VK_RBUTTON;
+		case Button::M: return VK_MBUTTON;
+		case Button::X1: return VK_XBUTTON1;
+		default: return VK_XBUTTON2;
+		}
+	}
+
+	bool IsButtonDown(Button button) {
+		return (GetAsyncKeyState(VirtualKeyOf(button)) & 0x8000) != 0;
+	}
+
+	void ResetGesture() {
+		if (g_gesture.capture != nullptr && GetCapture() == g_gesture.capture) {
+			ReleaseCapture();
+		}
+		g_gesture = {};
+	}
+
+	// ボタンの押下と離上を、元の位置のまま再送して通常のクリックにする
+	void ReplayClick(Button button) {
+		DWORD down_flag = 0;
+		DWORD up_flag = 0;
+		DWORD data = 0;
+		switch (VirtualKeyOf(button)) {
+		case VK_LBUTTON: down_flag = MOUSEEVENTF_LEFTDOWN; up_flag = MOUSEEVENTF_LEFTUP; break;
+		case VK_RBUTTON: down_flag = MOUSEEVENTF_RIGHTDOWN; up_flag = MOUSEEVENTF_RIGHTUP; break;
+		case VK_MBUTTON: down_flag = MOUSEEVENTF_MIDDLEDOWN; up_flag = MOUSEEVENTF_MIDDLEUP; break;
+		case VK_XBUTTON1: down_flag = MOUSEEVENTF_XDOWN; up_flag = MOUSEEVENTF_XUP; data = XBUTTON1; break;
+		default: down_flag = MOUSEEVENTF_XDOWN; up_flag = MOUSEEVENTF_XUP; data = XBUTTON2; break;
 		}
 
+		INPUT inputs[2]{};
+		inputs[0].type = INPUT_MOUSE;
+		inputs[0].mi.dwFlags = down_flag;
+		inputs[0].mi.mouseData = data;
+		inputs[1].type = INPUT_MOUSE;
+		inputs[1].mi.dwFlags = up_flag;
+		inputs[1].mi.mouseData = data;
+
+		// 再送したイベントは、フックを素通しさせる (カーソルは動いていないので座標指定は不要)
+		g_replay_remaining = static_cast<int>(SendInput(2, inputs, sizeof(INPUT)));
+	}
+
+	// 押下位置がレイヤーヘッダーで、割り当てがあれば、押下を奪って追跡を始める
+	bool BeginGesture(Button button, const MOUSEHOOKSTRUCTEX& mh) {
+		const Action action = g_actions[static_cast<size_t>(button)][CurrentModifiers()];
+		if (action == Action::None) {
+			return false;
+		}
+
+		HeaderQuery q;
+		q.point = mh.pt;
+		if (!g_edit_handle->call_edit_section_param(&q, SafeEdit<HeaderHitTestImpl>) || !q.hit) {
+			return false;
+		}
+
+		Gesture& g = g_gesture;
+		g = {};
+		g.active = true;
+		g.button = button;
+		g.down = mh.pt;
+		g.last_y = mh.pt.y;
+		g.track.last_layer = q.layer;
+		g.track.lock_mode = (action == Action::ToggleLock);
+		g.track.enable = g.track.lock_mode ? !q.locked : !q.enable;
+
+		// ウィンドウ外へ出ても移動と離上を受け取れるようにする
+		g.capture = mh.hwnd;
+		if (g.capture != nullptr) {
+			SetCapture(g.capture);
+		}
+		return true;
+	}
+
+	// マウス位置までを反映する。ドラッグと見なせる距離まで動くまでは何もしない
+	// (クリック中の数pxのブレで切り替わらないよう、システムのドラッグ判定距離を使う)
+	void StepGesture(POINT pt) {
+		Gesture& g = g_gesture;
+		if (!g.armed) {
+			if (std::abs(pt.x - g.down.x) < GetSystemMetrics(SM_CXDRAG) &&
+				std::abs(pt.y - g.down.y) < GetSystemMetrics(SM_CYDRAG)) {
+				return;
+			}
+			g.armed = true;
+		}
+		if (g.started && pt.y == g.last_y) {
+			return;
+		}
+
+		g.track.x = g.down.x;
+		g.track.y = pt.y;
+		g.track.first = !g.started;
+		// 失敗(出力中など)した場合は状態を進めず、次の移動で再試行する
+		if (g_edit_handle->call_edit_section_param(&g.track, SafeEdit<TrackImpl>)) {
+			g.started = true;
+			g.last_y = pt.y;
+		}
+	}
+
+	void EndGesture(POINT pt) {
+		StepGesture(pt); // 最後の位置まで反映する
+		const Gesture g = g_gesture;
+		ResetGesture();
+
+		// ドラッグにならなかった場合は、何も切り替えず、押下位置での通常のクリックとして再送する
+		if (!g.armed) {
+			if (pt.x != g.down.x || pt.y != g.down.y) {
+				SetCursorPos(g.down.x, g.down.y);
+			}
+			ReplayClick(g.button);
+		}
+	}
+
+	// ボタンメッセージをボタンと押下/離上に分解する
+	bool DecodeButtonMessage(UINT message, const MOUSEHOOKSTRUCTEX& mh, Button* button, bool* is_down) {
+		switch (message) {
+		case WM_LBUTTONDOWN: *button = Button::L; *is_down = true; return true;
+		case WM_LBUTTONUP: *button = Button::L; *is_down = false; return true;
+		case WM_RBUTTONDOWN: *button = Button::R; *is_down = true; return true;
+		case WM_RBUTTONUP: *button = Button::R; *is_down = false; return true;
+		case WM_MBUTTONDOWN: *button = Button::M; *is_down = true; return true;
+		case WM_MBUTTONUP: *button = Button::M; *is_down = false; return true;
+		case WM_XBUTTONDOWN:
+		case WM_XBUTTONUP:
+			*button = (HIWORD(mh.mouseData) == XBUTTON1) ? Button::X1 : Button::X2;
+			*is_down = (message == WM_XBUTTONDOWN);
+			return true;
+		}
+		return false;
+	}
+
+	// ホストのスレッド限定のマウスフック
+	// 他のプロセスや他のスレッドの入力には影響しない
+	LRESULT CALLBACK MouseHookProc(int code, WPARAM wparam, LPARAM lparam) {
+		// HC_NOREMOVE (PeekMessage で取り出されていない) の場合は、同じメッセージが再度来るので処理しない
+		if (code != HC_ACTION) {
+			return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
+		}
+
+		const auto& mh = *reinterpret_cast<const MOUSEHOOKSTRUCTEX*>(lparam);
+		const UINT message = static_cast<UINT>(wparam);
+
+		// 移動は奪わない (奪うとカーソル位置の更新が止まる)
+		if (message == WM_MOUSEMOVE) {
+			if (g_gesture.active) {
+				if (IsButtonDown(g_gesture.button)) {
+					StepGesture(mh.pt);
+				}
+				else {
+					EndGesture(mh.pt); // 離上を取り逃していた場合の安全弁
+				}
+			}
+			return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
+		}
+
+		Button button;
+		bool is_down;
+		if (!DecodeButtonMessage(message, mh, &button, &is_down)) {
+			return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
+		}
+
+		// 自分で再送したクリックは処理しない
+		if (g_replay_remaining > 0) {
+			--g_replay_remaining;
+			return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
+		}
+
+		if (g_gesture.active) {
+			if (button != g_gesture.button) {
+				return CallNextHookEx(g_mouse_hook, code, wparam, lparam); // 他のボタンには干渉しない
+			}
+			if (!is_down) {
+				EndGesture(mh.pt);
+				return 1;
+			}
+			// 離上を取り逃したまま次の押下が来た場合は、古い状態を捨てて新規として扱う
+			ResetGesture();
+		}
+
+		if (is_down && BeginGesture(button, mh)) {
+			return 1;
+		}
 		return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
 	}
 
@@ -673,24 +636,17 @@ EXTERN_C __declspec(dllexport) DWORD RequiredVersion() {
 	return kRequiredVersion;
 }
 
-EXTERN_C __declspec(dllexport) bool InitializePlugin(DWORD) {
-	return true;
-}
-
-// 終了処理　登録したフックやウィンドウなどを解放する
+// 終了処理　登録したフックやタイマーなどを解放する
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
 	if (g_mouse_hook != nullptr) {
 		UnhookWindowsHookEx(g_mouse_hook);
 		g_mouse_hook = nullptr;
 	}
-
-	g_input_capture = false;
-	g_drag = {};
-	if (g_message_window != nullptr) {
-		DestroyWindow(g_message_window);
-		g_message_window = nullptr;
+	if (g_notice_timer != 0) {
+		KillTimer(nullptr, g_notice_timer);
+		g_notice_timer = 0;
 	}
-	UnregisterClassW(kMessageWindowClass, g_instance);
+	ResetGesture();
 	g_edit_handle = nullptr;
 }
 
@@ -698,42 +654,33 @@ EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable() {
 	return &g_plugin_table;
 }
 
-// 登録処理　エディットハンドルやメッセージ用ウィンドウ、マウスフックを初期化する
+// 登録処理　設定を読み込み、割り当てがあればマウスフックを設置する
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
-	// ホストテーブルを保存しておく
-	g_host = host;
-	host->set_plugin_information(g_plugin_table.information);
-
 	g_edit_handle = host->create_edit_handle();
 	if (g_edit_handle == nullptr) {
-		OutputDebugStringW(L"toggle_layers_exedit2: create_edit_handle failed.\n");
+		Log(LogLevel::Error, L"create_edit_handle に失敗しました。");
 		return;
 	}
 
-	WNDCLASSEXW window_class{};
-	window_class.cbSize = sizeof(window_class);
-	window_class.hInstance = g_instance;
-	window_class.lpfnWndProc = MessageWindowProc;
-	window_class.lpszClassName = kMessageWindowClass;
-	if (RegisterClassExW(&window_class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-		OutputDebugStringW(L"toggle_layers_exedit2: RegisterClassExW failed.\n");
+	if (LoadConfig() == ConfigStatus::IniMissing) {
+		ScheduleIniMissingNotice();
+	}
+
+	// 割り当てが1つも無ければ、フックを設置する意味がない
+	if (g_action_count == 0) {
+		Log(LogLevel::Verbose, L"有効な割り当てがないため、マウスフックを設置しません。");
 		return;
 	}
 
-	g_message_window = CreateWindowExW(
-		0, kMessageWindowClass, L"", 0,
-		0, 0, 0, 0, HWND_MESSAGE, nullptr, g_instance, nullptr);
-	if (g_message_window == nullptr) {
-		OutputDebugStringW(L"toggle_layers_exedit2: CreateWindowExW failed.\n");
-		return;
+	// ホストの UI スレッドにだけフックを掛ける (システム全体の入力には影響しない)
+	const HWND host_window = g_edit_handle->get_host_app_window();
+	DWORD thread_id = (host_window != nullptr) ? GetWindowThreadProcessId(host_window, nullptr) : 0;
+	if (thread_id == 0) {
+		thread_id = GetCurrentThreadId();
 	}
 
-	// ini から設定をロード
-	LoadConfig();
-
-	// フック内ではメッセージを送るだけにし、SDKの処理は後で実行する
-	g_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, g_instance, 0);
+	g_mouse_hook = SetWindowsHookExW(WH_MOUSE, MouseHookProc, g_instance, thread_id);
 	if (g_mouse_hook == nullptr) {
-		OutputDebugStringW(L"toggle_layers_exedit2: SetWindowsHookExW failed.\n");
+		Log(LogLevel::Error, L"SetWindowsHookExW に失敗しました (error=%lu)", GetLastError());
 	}
 }
