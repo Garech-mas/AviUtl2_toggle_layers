@@ -5,8 +5,8 @@
 #include <set>
 #include <vector>
 
-#include "sdk/plugin2.h"
-#include "sdk/logger2.h"
+#include "aviutl2_sdk/plugin2.h"
+#include "aviutl2_sdk/logger2.h"
 
 #include <cstdarg>
 
