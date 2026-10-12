@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "plugin2.h"
+#include "config2.h"
 #include "logger2.h"
 #include "resource.h"
 
@@ -17,11 +18,12 @@ namespace {
 	constexpr DWORD kRequiredVersion = 2004500; // 必須バージョン: beta45
 	constexpr wchar_t kIniFileName[] = L"toggle_layers.ini";
 	constexpr wchar_t kIniSection[] = L"mouse_override.layer.drag";
-	constexpr UINT kNoticeDelayMs = 500; // ini 無し通知を出すまでの待ち時間(ホストの起動完了待ち)
 
 	HINSTANCE g_instance = nullptr;
+	CONFIG_HANDLE* g_config = nullptr;
 	LOG_HANDLE* g_logger = nullptr;
 	EDIT_HANDLE* g_edit_handle = nullptr;
+	HWND g_host_window = nullptr;
 	HHOOK g_mouse_hook = nullptr;
 	UINT_PTR g_notice_timer = 0;
 	std::wstring g_ini_path;
@@ -475,8 +477,59 @@ namespace {
 		g_replay_remaining = static_cast<int>(SendInput(2, inputs, sizeof(INPUT)));
 	}
 
+	// 本体の HWND、または分離されたレイヤー編集ウィンドウかを判定する
+	bool IsTimelineWindow(HWND hwnd) {
+		if (hwnd == nullptr) {
+			return false;
+		}
+
+		// 本体の HWND 自身は対象とする
+		if (hwnd == g_host_window) {
+			return true;
+		}
+
+		// 同じプロセス内のウィンドウで、キャプションが「レイヤー編集」なら対象とする
+		const HWND root = GetAncestor(hwnd, GA_ROOT);
+		if (root == nullptr || root == g_host_window) {
+			return false;
+		}
+
+		DWORD root_pid = 0;
+		DWORD host_pid = 0;
+		GetWindowThreadProcessId(root, &root_pid);
+		if (g_host_window == nullptr ||
+			GetWindowThreadProcessId(g_host_window, &host_pid) == 0 || root_pid != host_pid) {
+			return false;
+		}
+
+		wchar_t caption[256]{};
+		const int length = GetWindowTextW(root, caption, ARRAYSIZE(caption));
+		if (length <= 0) {
+			return false;
+		}
+
+		constexpr LPCWSTR kOriginalCaption = L"レイヤー編集";
+		if (wcscmp(caption, kOriginalCaption) == 0) {
+			return true;
+		}
+
+		if (g_config != nullptr && g_config->get_language_text != nullptr) {
+			const LPCWSTR translated = g_config->get_language_text(
+				g_config, L"Menu", kOriginalCaption);
+			if (translated != nullptr && wcscmp(caption, translated) == 0) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	// 押下位置がレイヤーヘッダーで、割り当てがあれば、押下を奪って追跡を始める
 	bool BeginGesture(Button button, const MOUSEHOOKSTRUCTEX& mh) {
+		// タイムラインウィンドウ以外では割り当て判定を行わない
+		if (!IsTimelineWindow(mh.hwnd)) {
+			return false;
+		}
 		const Action action = g_actions[static_cast<size_t>(button)][CurrentModifiers()];
 		if (action == Action::None) {
 			return false;
@@ -504,11 +557,8 @@ namespace {
 		g.track.lock_mode = (action == Action::ToggleLock);
 		g.track.enable = g.track.lock_mode ? !q.locked : !q.enable;
 
-		// ウィンドウ外へ出ても移動と離上を受け取れるようにする
+		// クリック直後はキャプチャしない。ドラッグ判定距離を超えた時点で取得する。
 		g.capture = mh.hwnd;
-		if (g.capture != nullptr) {
-			SetCapture(g.capture);
-		}
 		return true;
 	}
 
@@ -522,6 +572,11 @@ namespace {
 				return;
 			}
 			g.armed = true;
+			// クリックだけの操作や、ウィンドウのドッキング操作を妨げないよう、
+			// 実際にドラッグと判定してからマウスキャプチャを取得する。
+			if (g.capture != nullptr) {
+				SetCapture(g.capture);
+			}
 		}
 		if (g.started && pt.y == g.last_y) {
 			return;
@@ -641,7 +696,6 @@ namespace {
 } // namespace
 
 // DLL のエントリポイント
-// DLL_PROCESS_ATTACH でインスタンスハンドルを保存し、スレッド通知を無効化する
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
 	if (reason == DLL_PROCESS_ATTACH) {
 		g_instance = instance;
@@ -650,7 +704,12 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
 	return TRUE;
 }
 
-// logger2 初期化コールバック（ホストが呼ぶ）
+// config2 初期化コールバック
+EXTERN_C __declspec(dllexport) void InitializeConfig(CONFIG_HANDLE* config) {
+	g_config = config;
+}
+
+// logger2 初期化コールバック
 EXTERN_C __declspec(dllexport) void InitializeLogger(LOG_HANDLE* logger) {
 	g_logger = logger;
 }
@@ -672,6 +731,8 @@ EXTERN_C __declspec(dllexport) void UninitializePlugin() {
 	ResetGesture();
 	g_host_ready = false;
 	g_edit_handle = nullptr;
+	g_host_window = nullptr;
+	g_config = nullptr;
 }
 
 EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable() {
@@ -694,6 +755,7 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 
 	// ホストの UI スレッドにだけフックを掛ける (システム全体の入力には影響しない)
 	const HWND host_window = g_edit_handle->get_host_app_window();
+	g_host_window = host_window;
 	DWORD thread_id = (host_window != nullptr) ? GetWindowThreadProcessId(host_window, nullptr) : 0;
 	if (thread_id == 0) {
 		thread_id = GetCurrentThreadId();
