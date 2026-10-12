@@ -25,8 +25,6 @@ namespace {
 	EDIT_HANDLE* g_edit_handle = nullptr;
 	HWND g_host_window = nullptr;
 	HHOOK g_mouse_hook = nullptr;
-	UINT_PTR g_notice_timer = 0;
-	std::wstring g_ini_path;
 	int g_replay_remaining = 0;               // SendInput で再送した、まだ届いていないボタンイベントの数
 	int g_hook_depth = 0;                     // フックプロシージャの入れ子の深さ (再入ガード用)
 	std::atomic<bool> g_host_ready{ false };  // ホストが API を受け付けられる状態になったか (プロジェクトのロード後)
@@ -135,15 +133,13 @@ namespace {
 	}
 
 	Action ParseAction(int value) {
-		if (value == 0) return Action::None;
+		if (value == 1) return Action::ToggleVisible;
 		if (value == 2) return Action::ToggleLock;
-		return Action::ToggleVisible; // 1 と、その他の値は表示トグルとして扱う
+		return Action::None;
 	}
 
-	enum class ConfigStatus { Loaded, IniMissing, Failed };
-
 	// ini ファイルから設定をロードする
-	ConfigStatus LoadConfig() {
+	void LoadConfig() {
 		g_actions = {};
 		g_action_count = 0;
 
@@ -151,17 +147,16 @@ namespace {
 		const DWORD len = GetModuleFileNameW(g_instance, module_path, ARRAYSIZE(module_path));
 		if (len == 0 || len >= ARRAYSIZE(module_path)) {
 			Log(LogLevel::Error, L"DLL のパスを取得できませんでした。");
-			return ConfigStatus::Failed;
+			return;
 		}
 		const std::wstring path(module_path, len);
 		const size_t slash = path.find_last_of(L"\\/");
 		const std::wstring dir = (slash == std::wstring::npos) ? std::wstring(L".") : path.substr(0, slash);
-		g_ini_path = dir + L"\\" + kIniFileName;
+		const std::wstring ini_path = dir + L"\\" + kIniFileName;
 
 		// 既に設定ファイルが存在する場合はそれを使う
-		bool embedded_written = false;
-		if (GetFileAttributesW(g_ini_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-			Log(LogLevel::Verbose, L"既存の設定ファイルを使用します: %ls", g_ini_path.c_str());
+		if (GetFileAttributesW(ini_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+			Log(LogLevel::Verbose, L"既存の設定ファイルを使用します: %ls", ini_path.c_str());
 		}
 		else {
 			// 設定ファイルがない場合はリソースから展開する
@@ -172,15 +167,14 @@ namespace {
 					void* data = LockResource(hglob);
 					const DWORD size = SizeofResource(g_instance, hres);
 					if (data != nullptr && size > 0) {
-						HANDLE fh = CreateFileW(g_ini_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+						HANDLE fh = CreateFileW(ini_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
 						if (fh != INVALID_HANDLE_VALUE) {
 							DWORD written = 0;
 							if (WriteFile(fh, data, size, &written, nullptr) && written == size) {
-								Log(LogLevel::Verbose, L"埋め込み設定ファイルを展開しました: %ls", g_ini_path.c_str());
-								embedded_written = true;
+								Log(LogLevel::Verbose, L"埋め込み設定ファイルを展開しました: %ls", ini_path.c_str());
 							}
 							else {
-								Log(LogLevel::Warn, L"埋め込み設定ファイルの書き出しに失敗しました: %ls (err=%lu)", g_ini_path.c_str(), GetLastError());
+								Log(LogLevel::Warn, L"埋め込み設定ファイルの書き出しに失敗しました: %ls (err=%lu)", ini_path.c_str(), GetLastError());
 							}
 							CloseHandle(fh);
 						}
@@ -191,12 +185,10 @@ namespace {
 
 		constexpr DWORD kBufSize = 32768;
 		std::vector<wchar_t> buf(kBufSize);
-		if (GetPrivateProfileSectionW(kIniSection, buf.data(), kBufSize, g_ini_path.c_str()) == 0) {
+		if (GetPrivateProfileSectionW(kIniSection, buf.data(), kBufSize, ini_path.c_str()) == 0) {
 			Log(LogLevel::Warn, L"ini: セクション [%ls] がないか空です。", kIniSection);
-			return ConfigStatus::Loaded;
+			return;
 		}
-
-		std::array<std::array<bool, kModCombos>, kButtonCount> seen{};
 
 		// バッファは複数のヌル終端文字列が連続しており、末尾は二重ヌルで終わる
 		for (const wchar_t* p = buf.data(); *p != L'\0'; p += wcslen(p) + 1) {
@@ -224,21 +216,10 @@ namespace {
 
 			Button button;
 			if (!ParseButton(base, &button)) {
-				Log(LogLevel::Warn, L"ini: 不明なボタン '%ls' を無視しました。", key.c_str());
 				continue;
 			}
-
-			// 重複キーは先に書かれたものを優先する (Windows の ini の扱いと同じ)
-			if (seen[static_cast<size_t>(button)][mods]) {
-				Log(LogLevel::Warn, L"ini: キー '%ls' が重複しています。先の指定を使用します。", key.c_str());
-				continue;
-			}
-			seen[static_cast<size_t>(button)][mods] = true;
 
 			const int value = _wtoi(val.c_str());
-			if (value < 0 || value > 2) {
-				Log(LogLevel::Warn, L"ini: '%ls' の値 %d は未定義です。表示トグルとして扱います。", key.c_str(), value);
-			}
 			const Action action = ParseAction(value);
 			g_actions[static_cast<size_t>(button)][mods] = action;
 			if (action != Action::None) {
@@ -246,10 +227,8 @@ namespace {
 			}
 		}
 
-		Log(LogLevel::Verbose, L"設定を読み込みました (割り当て %zu 件): %ls", g_action_count, g_ini_path.c_str());
-		return ConfigStatus::Loaded;
+		Log(LogLevel::Verbose, L"設定を読み込みました (割り当て %zu 件): %ls", g_action_count, ini_path.c_str());
 	}
-
 
 
 	// ------------------------------------------------------------------
@@ -718,21 +697,18 @@ EXTERN_C __declspec(dllexport) DWORD RequiredVersion() {
 	return kRequiredVersion;
 }
 
-// 終了処理　登録したフックやタイマーなどを解放する
+// 終了処理　登録したフックなどを解放する
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
 	if (g_mouse_hook != nullptr) {
 		UnhookWindowsHookEx(g_mouse_hook);
 		g_mouse_hook = nullptr;
-	}
-	if (g_notice_timer != 0) {
-		KillTimer(nullptr, g_notice_timer);
-		g_notice_timer = 0;
 	}
 	ResetGesture();
 	g_host_ready = false;
 	g_edit_handle = nullptr;
 	g_host_window = nullptr;
 	g_config = nullptr;
+	g_logger = nullptr;
 }
 
 EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable() {
