@@ -31,7 +31,7 @@ namespace {
 
 	COMMON_PLUGIN_TABLE g_plugin_table = {
 		L"レイヤー一括切り替え",
-		L"レイヤー一括切り替え v2.2 ported by Garech"
+		L"レイヤー一括切り替え v2.3 ported by Garech"
 	};
 
 	// ------------------------------------------------------------------
@@ -519,6 +519,10 @@ namespace {
 		if (!g_host_ready.load()) {
 			return false;
 		}
+		// 編集中以外は編集セクションを呼び出さない。
+		if (g_edit_handle->get_edit_state() != EDIT_HANDLE::EDIT_STATE_EDIT) {
+			return false;
+		}
 
 		HeaderQuery q;
 		q.point = mh.pt;
@@ -561,10 +565,15 @@ namespace {
 			return;
 		}
 
+		// 再生・出力中は編集セクションを呼び出さない。
+		if (g_edit_handle->get_edit_state() != EDIT_HANDLE::EDIT_STATE_EDIT) {
+			return;
+		}
+
 		g.track.x = g.down.x;
 		g.track.y = pt.y;
 		g.track.first = !g.started;
-		// 失敗(出力中など)した場合は状態を進めず、次の移動で再試行する
+		// 失敗した場合は状態を進めず、次の移動で再試行する
 		if (g_edit_handle->call_edit_section_param(&g.track, SafeEdit<TrackImpl>)) {
 			g.started = true;
 			g.last_y = pt.y;
