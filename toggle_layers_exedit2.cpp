@@ -1,18 +1,15 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
-#include <functional>
+#include <atomic>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstdio>
-#include <cwchar>
-#include <cwctype>
 #include <string>
 #include <vector>
 
 #include "plugin2.h"
 #include "logger2.h"
-// Resource header for embedded toggle_layers.ini
 #include "resource.h"
 
 namespace {
@@ -28,11 +25,13 @@ namespace {
 	HHOOK g_mouse_hook = nullptr;
 	UINT_PTR g_notice_timer = 0;
 	std::wstring g_ini_path;
-	int g_replay_remaining = 0; // SendInput で再送した、まだ届いていないボタンイベントの数
+	int g_replay_remaining = 0;               // SendInput で再送した、まだ届いていないボタンイベントの数
+	int g_hook_depth = 0;                     // フックプロシージャの入れ子の深さ (再入ガード用)
+	std::atomic<bool> g_host_ready{ false };  // ホストが API を受け付けられる状態になったか (プロジェクトのロード後)
 
 	COMMON_PLUGIN_TABLE g_plugin_table = {
 		L"レイヤー一括切り替え",
-		L"レイヤー一括切り替え v2.1 ported by Garech"
+		L"レイヤー一括切り替え v2.2 ported by Garech"
 	};
 
 	// ------------------------------------------------------------------
@@ -249,15 +248,7 @@ namespace {
 		return ConfigStatus::Loaded;
 	}
 
-	// ini が無かった時にメッセージボックスを出す
-	void ShowIniMissingNotice() {
-		std::wstring text = L"設定ファイルが見つかりません。\n\n";
-		text += g_ini_path;
-		text += L"\n\nファイルを配置するまで、レイヤー一括切り替えは動作しません。\n\n";
 
-		const HWND owner = (g_edit_handle != nullptr) ? g_edit_handle->get_host_app_window() : nullptr;
-		MessageBoxW(owner, text.c_str(), g_plugin_table.name, MB_OK | MB_ICONWARNING);
-	}
 
 	// ------------------------------------------------------------------
 	// 編集セクション内の処理
@@ -340,8 +331,7 @@ namespace {
 		int x2 = 0;
 		if (!FindFrameStartX(edit, x, y, limit, start + 1, &x1) ||
 			!FindFrameStartX(edit, x1, y, limit, start + 2, &x2)) {
-			Log(LogLevel::Verbose, L"ヘッダー境界を求められませんでした。ヘッダー扱いにします。");
-			return true;
+			return true; // 境界を求められなければ、ヘッダー扱いにする
 		}
 		const int content_left = x1 - (x2 - x1);
 		return x < content_left;
@@ -492,6 +482,12 @@ namespace {
 			return false;
 		}
 
+		// プロジェクトのロード通知が来るまで (起動処理中) は、ホストの API を一切呼ばず、通常のクリックとして扱う。
+		// この間に call_edit_section を呼ぶと、ホストがアクセス違反を起こして固まる。
+		if (!g_host_ready.load()) {
+			return false;
+		}
+
 		HeaderQuery q;
 		q.point = mh.pt;
 		if (!g_edit_handle->call_edit_section_param(&q, SafeEdit<HeaderHitTestImpl>) || !q.hit) {
@@ -581,6 +577,15 @@ namespace {
 			return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
 		}
 
+		// 再入ガード: 編集セクション内などでメッセージが処理され、フックが入れ子で呼ばれた場合は、何もせず通す
+		if (g_hook_depth > 0) {
+			return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
+		}
+		struct DepthGuard {
+			DepthGuard() { ++g_hook_depth; }
+			~DepthGuard() { --g_hook_depth; }
+		} depth_guard;
+
 		const auto& mh = *reinterpret_cast<const MOUSEHOOKSTRUCTEX*>(lparam);
 		const UINT message = static_cast<UINT>(wparam);
 
@@ -627,6 +632,12 @@ namespace {
 		return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
 	}
 
+	// プロジェクトのロード/初期化の直後に呼ばれる。ホストが API を受け付けられる合図にする
+	// (フラグを立てるだけで、ホストの API には触らない)
+	void OnProjectLoad(PROJECT_FILE*) {
+		g_host_ready = true;
+	}
+
 } // namespace
 
 // DLL のエントリポイント
@@ -659,6 +670,7 @@ EXTERN_C __declspec(dllexport) void UninitializePlugin() {
 		g_notice_timer = 0;
 	}
 	ResetGesture();
+	g_host_ready = false;
 	g_edit_handle = nullptr;
 }
 
@@ -675,6 +687,10 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 	}
 
 	LoadConfig();
+
+	// ホストの初期化が終わるまで、フックはホストの API を呼ばない (OnProjectLoad が合図)
+	g_host_ready = false;
+	host->register_project_load_handler(OnProjectLoad);
 
 	// ホストの UI スレッドにだけフックを掛ける (システム全体の入力には影響しない)
 	const HWND host_window = g_edit_handle->get_host_app_window();
